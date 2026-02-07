@@ -863,20 +863,6 @@ try:
             if not enriched_wc.empty:
                 wildcard_picks_df = enriched_wc.reset_index(drop=True)
 
-        # Apply RT filters to enriched surprise picks
-        def _passes_rt_filter(row):
-            rt = row.get("RT (%)")
-            if require_rt and (rt is None or (isinstance(rt, float) and pd.isna(rt))):
-                return False
-            if rt is not None and not (isinstance(rt, float) and pd.isna(rt)) and rt < min_rt:
-                return False
-            return True
-
-        if surprise_df is not None and not surprise_df.empty:
-            surprise_df = surprise_df[surprise_df.apply(_passes_rt_filter, axis=1)].reset_index(drop=True)
-        if wildcard_picks_df is not None and not wildcard_picks_df.empty:
-            wildcard_picks_df = wildcard_picks_df[wildcard_picks_df.apply(_passes_rt_filter, axis=1)].reset_index(drop=True)
-
         # Generate diversity reasons
         used_d: set[str] = set()
         used_g: set[str] = set()
