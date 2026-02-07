@@ -42,6 +42,7 @@ DEFAULT_SURPRISE_PICKS = 5
 DIVERSITY_WEIGHT_GENRE = 2
 DIVERSITY_WEIGHT_DEFAULT = 1
 WILDCARD_TMDB_FLOOR = 6.0
+SURPRISE_MIN_VOTES = 100
 
 
 def load_seen() -> set[str]:
@@ -739,6 +740,9 @@ try:
 
     if surprise_enabled:
         pool = df_all.copy()
+
+        # Require minimum vote count to avoid very obscure titles
+        pool = pool[pool["TMDB Votes"].fillna(0) >= SURPRISE_MIN_VOTES].reset_index(drop=True)
 
         # Apply the same RT filters as other modes
         if surprise_require_rt or require_rt:
