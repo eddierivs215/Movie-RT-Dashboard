@@ -488,6 +488,31 @@ if not genres_map:
 genre_names = sorted(genres_map.keys())
 
 with st.sidebar:
+    st.header("Filters")
+
+    with st.form("filter_form"):
+        selected_genres = st.multiselect("Genres", genre_names, default=[])
+
+        min_rt = st.slider("Minimum Rotten Tomatoes score", 0, 100, 0, 1)
+
+        runtime_bucket = st.selectbox(
+            "Runtime", ["Any", "< 2 hours", "2–3 hours", "> 3 hours"], index=0
+        )
+
+        year_min, year_max = st.slider(
+            "Release year range", 1950, CURRENT_YEAR + 1, (1950, CURRENT_YEAR + 1)
+        )
+
+        max_pages = st.slider("Search depth (TMDB pages)", 1, 5, 3)
+
+        require_rt = st.checkbox("Require RT score (strict)", value=False)
+        st.caption("If strict is off, movies missing RT can appear (ranked lower).")
+
+        hide_seen = st.checkbox("Hide movies I've seen", value=False)
+
+        applied = st.form_submit_button("🔍 Apply filters")
+
+    st.divider()
     st.header("⚡ Mode")
     view_mode = st.radio(
         "Choose your mode",
@@ -519,30 +544,7 @@ with st.sidebar:
         surprise_exclude_seen = True
 
     st.divider()
-    st.header("Filters")
-
-    selected_genres = st.multiselect(
-        "Genres",
-        genre_names,
-        default=[g for g in ["Science Fiction", "Fantasy"] if g in genre_names],
-    )
-
-    min_rt = st.slider("Minimum Rotten Tomatoes score", 0, 100, 80, 1)
-
-    runtime_bucket = st.selectbox(
-        "Runtime", ["< 2 hours", "2–3 hours", "> 3 hours"], index=1
-    )
-
-    year_min, year_max = st.slider("Release year range", 1950, CURRENT_YEAR + 1, (2000, CURRENT_YEAR + 1))
-
-    max_pages = st.slider("Search depth (TMDB pages)", 1, 5, 3)
-
-    require_rt = st.checkbox("Require RT score (strict)", value=False)
-    st.caption("If strict is off, movies missing RT can appear (ranked lower).")
-
-    st.divider()
     st.header("Watch history")
-    hide_seen = st.checkbox("Hide movies I've seen", value=False)
 
     if st.button("💾 Save"):
         if save_seen(st.session_state.seen_movies):
