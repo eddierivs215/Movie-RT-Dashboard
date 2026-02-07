@@ -738,8 +738,12 @@ try:
     if surprise_enabled:
         pool = df_all.copy()
 
-        if surprise_require_rt:
+        # Apply the same RT filters as other modes
+        if surprise_require_rt or require_rt:
             pool = pool[pool["RT (%)"].notna()].reset_index(drop=True)
+        # Exclude movies with RT below min_rt (keep those without RT — they'll be enriched later)
+        has_rt = pool["RT (%)"].notna()
+        pool = pool[~has_rt | (pool["RT (%)"] >= min_rt)].reset_index(drop=True)
 
         surprise_pool_size = len(pool)
 
@@ -855,10 +859,23 @@ try:
         if display_picks:
             surprise_df = df_all[df_all["Title"].isin(display_picks)].reset_index(drop=True)
         if display_wildcards and not wildcard_picks_df.empty:
-            # Re-fetch enriched data for wildcards too
             enriched_wc = df_all[df_all["Title"].isin(display_wildcards)]
             if not enriched_wc.empty:
                 wildcard_picks_df = enriched_wc.reset_index(drop=True)
+
+        # Apply RT filters to enriched surprise picks
+        def _passes_rt_filter(row):
+            rt = row.get("RT (%)")
+            if require_rt and (rt is None or (isinstance(rt, float) and pd.isna(rt))):
+                return False
+            if rt is not None and not (isinstance(rt, float) and pd.isna(rt)) and rt < min_rt:
+                return False
+            return True
+
+        if surprise_df is not None and not surprise_df.empty:
+            surprise_df = surprise_df[surprise_df.apply(_passes_rt_filter, axis=1)].reset_index(drop=True)
+        if wildcard_picks_df is not None and not wildcard_picks_df.empty:
+            wildcard_picks_df = wildcard_picks_df[wildcard_picks_df.apply(_passes_rt_filter, axis=1)].reset_index(drop=True)
 
         # Generate diversity reasons
         used_d: set[str] = set()
