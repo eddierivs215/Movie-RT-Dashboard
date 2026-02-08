@@ -3,14 +3,14 @@ from recommend import rank_score, runtime_bucket_to_bounds, _safe_float, _safe_i
 
 
 class TestRuntimeBucketToBounds:
-    def test_under_2_hours(self):
-        assert runtime_bucket_to_bounds("< 2 hours") == (0, 119)
+    def test_under_1_hour(self):
+        assert runtime_bucket_to_bounds("< 1 hour") == (0, 59)
 
-    def test_2_to_3_hours(self):
-        assert runtime_bucket_to_bounds("2–3 hours") == (120, 179)
+    def test_1_to_2_hours(self):
+        assert runtime_bucket_to_bounds("1–2 hours") == (60, 119)
 
-    def test_over_3_hours(self):
-        assert runtime_bucket_to_bounds("> 3 hours") == (180, None)
+    def test_over_2_hours(self):
+        assert runtime_bucket_to_bounds("> 2 hours") == (120, None)
 
     def test_unknown_bucket(self):
         assert runtime_bucket_to_bounds("something") == (None, None)

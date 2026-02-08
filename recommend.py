@@ -14,12 +14,12 @@ IMDB_CONFIDENCE_CAP = 50000
 
 def runtime_bucket_to_bounds(bucket: str) -> Tuple[Optional[int], Optional[int]]:
     b = (bucket or "").strip()
-    if b == "< 2 hours":
-        return (0, 119)
-    if b == "2–3 hours":
-        return (120, 179)
-    if b == "> 3 hours":
-        return (180, None)
+    if b == "< 1 hour":
+        return (0, 59)
+    if b == "1–2 hours":
+        return (60, 119)
+    if b == "> 2 hours":
+        return (120, None)
     return (None, None)
 
 

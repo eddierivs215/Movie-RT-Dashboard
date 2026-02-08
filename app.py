@@ -28,8 +28,8 @@ NEAR_MISS_RT_OFFSET = 15
 NEAR_MISS_RT_FLOOR = 50
 NEAR_MISS_TMDB_FLOOR = 7.0
 SURPRISE_TMDB_FLOOR = 6.5
-RUNTIME_SHORT_MAX = 100   # minutes; below this = "short"
-RUNTIME_MEDIUM_MAX = 140  # minutes; above this = "long"
+RUNTIME_SHORT_MAX = 60    # minutes; below this = "short"
+RUNTIME_MEDIUM_MAX = 120  # minutes; above this = "long"
 CURRENT_YEAR = date.today().year
 
 # Diversity & surprise constants
@@ -532,7 +532,7 @@ with st.sidebar:
 
         runtime_label = "Episode length" if content_type == "TV Shows" else "Runtime"
         runtime_bucket = st.selectbox(
-            runtime_label, ["Any", "< 2 hours", "2–3 hours", "> 3 hours"], index=0
+            runtime_label, ["Any", "< 1 hour", "1–2 hours", "> 2 hours"], index=0
         )
 
         year_min, year_max = st.slider(
