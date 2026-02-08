@@ -89,3 +89,52 @@ def tmdb_movie_details(api_key: str, movie_id: int) -> dict:
     if data is None:
         return {}
     return data
+
+
+# ------------------------------------------------------------------
+# TV Show endpoints
+# ------------------------------------------------------------------
+
+def tmdb_get_tv_genres(api_key: str) -> dict[str, int]:
+    data = _tmdb_request(
+        f"{TMDB_BASE}/genre/tv/list",
+        params={"api_key": api_key, "language": "en-US"},
+    )
+    if data is None:
+        return {}
+    return {g["name"]: g["id"] for g in data.get("genres", [])}
+
+
+def tmdb_discover_tv(
+    api_key: str,
+    genre_ids: List[int],
+    year_min: Optional[int],
+    year_max: Optional[int],
+    page: int = 1,
+) -> dict:
+    params = {
+        "api_key": api_key,
+        "language": "en-US",
+        "sort_by": "popularity.desc",
+        "include_adult": "false",
+        "page": page,
+        "with_genres": ",".join(map(str, genre_ids)) if genre_ids else None,
+        "first_air_date.gte": f"{year_min}-01-01" if year_min else None,
+        "first_air_date.lte": f"{year_max}-12-31" if year_max else None,
+    }
+    params = {k: v for k, v in params.items() if v is not None}
+
+    data = _tmdb_request(f"{TMDB_BASE}/discover/tv", params=params)
+    if data is None:
+        return {"results": []}
+    return data
+
+
+def tmdb_tv_details(api_key: str, tv_id: int) -> dict:
+    data = _tmdb_request(
+        f"{TMDB_BASE}/tv/{tv_id}",
+        params={"api_key": api_key, "language": "en-US", "append_to_response": "external_ids"},
+    )
+    if data is None:
+        return {}
+    return data

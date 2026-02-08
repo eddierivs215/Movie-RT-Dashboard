@@ -11,7 +11,7 @@ import streamlit as st
 import pandas as pd
 from dotenv import load_dotenv
 
-from tmdb import tmdb_get_genres, tmdb_discover_movies, tmdb_movie_details
+from tmdb import tmdb_get_genres, tmdb_discover_movies, tmdb_movie_details, tmdb_get_tv_genres, tmdb_discover_tv, tmdb_tv_details
 from omdb import omdb_lookup_by_imdb_id, extract_rotten_tomatoes_score, extract_imdb_score, get_cache_size, flush_cache
 from recommend import runtime_bucket_to_bounds, rank_score, W_RT, W_AUDIENCE, W_EVIDENCE, W_AUDIENCE_NO_RT, W_EVIDENCE_NO_RT
 
@@ -294,9 +294,20 @@ def cached_genres():
 
 
 @st.cache_data(ttl=24 * 3600)
+def cached_tv_genres():
+    return tmdb_get_tv_genres(TMDB_API_KEY)
+
+
+@st.cache_data(ttl=24 * 3600)
 def cached_discover(genre_ids_key: str, runtime_min, runtime_max, year_min, year_max, page: int):
     genre_ids = [int(g) for g in genre_ids_key.split(",") if g] if genre_ids_key else []
     return tmdb_discover_movies(TMDB_API_KEY, genre_ids, runtime_min, runtime_max, year_min, year_max, page)
+
+
+@st.cache_data(ttl=24 * 3600)
+def cached_discover_tv(genre_ids_key: str, year_min, year_max, page: int):
+    genre_ids = [int(g) for g in genre_ids_key.split(",") if g] if genre_ids_key else []
+    return tmdb_discover_tv(TMDB_API_KEY, genre_ids, year_min, year_max, page)
 
 
 @st.cache_data(ttl=24 * 3600)
@@ -304,9 +315,14 @@ def cached_tmdb_details(movie_id: int):
     return tmdb_movie_details(TMDB_API_KEY, movie_id)
 
 
-def tracked_omdb_lookup(imdb_id: str) -> dict | None:
+@st.cache_data(ttl=24 * 3600)
+def cached_tmdb_tv_details(tv_id: int):
+    return tmdb_tv_details(TMDB_API_KEY, tv_id)
+
+
+def tracked_omdb_lookup(imdb_id: str, media_type: str = "movie") -> dict | None:
     st.session_state.omdb_lookups_this_run += 1
-    result = omdb_lookup_by_imdb_id(OMDB_API_KEY, imdb_id)
+    result = omdb_lookup_by_imdb_id(OMDB_API_KEY, imdb_id, media_type=media_type)
     if result and result.get("_rate_limited"):
         st.session_state.omdb_rate_limited = True
         return None
@@ -450,14 +466,21 @@ def render_movie_card(
 
     wildcard_badge = " 🃏" if is_wildcard else ""
     genre_badge = f" `{genre}`" if genre else ""
+    media_type = row.get("Type", "Movie")
+    type_badge = f" {'📺' if media_type == 'TV' else '🎬'}" if row.get("Type") else ""
 
-    st.markdown(f"**{title}**{wildcard_badge}{genre_badge}")
+    st.markdown(f"**{title}**{type_badge}{wildcard_badge}{genre_badge}")
 
     st.markdown(
         f"RT: **{rt_text}** · IMDb: **{imdb_text}** ({imdb_votes_text} votes) · "
         f"TMDB: **{tmdb_vote}** ({tmdb_votes:,} votes)"
     )
-    st.markdown(f"{release_year} · {runtime} min")
+
+    seasons = row.get("Seasons")
+    if media_type == "TV" and seasons:
+        st.markdown(f"{release_year} · {int(seasons)} season{'s' if int(seasons) != 1 else ''} · {runtime} min/ep")
+    else:
+        st.markdown(f"{release_year} · {runtime} min")
 
     if diversity_reason:
         st.caption(f"*{diversity_reason}*")
@@ -483,21 +506,33 @@ def render_movie_card(
 # ------------------------------------------------------------------
 # Sidebar controls
 # ------------------------------------------------------------------
-genres_map = cached_genres()
-if not genres_map:
+genres_map_movies = cached_genres()
+genres_map_tv = cached_tv_genres()
+if not genres_map_movies and not genres_map_tv:
     st.warning("Could not load genres from TMDB. Check your API key or try again later.")
-genre_names = sorted(genres_map.keys())
 
 with st.sidebar:
     st.header("Filters")
 
     with st.form("filter_form"):
+        content_type = st.radio("Content type", ["Movies", "TV Shows", "Both"], index=0)
+
+        # Merge genre maps based on content type
+        if content_type == "Movies":
+            genres_map = genres_map_movies
+        elif content_type == "TV Shows":
+            genres_map = genres_map_tv
+        else:
+            genres_map = {**genres_map_movies, **genres_map_tv}
+        genre_names = sorted(genres_map.keys())
+
         selected_genres = st.multiselect("Genres", genre_names, default=[])
 
         min_rt = st.slider("Minimum Rotten Tomatoes score", 0, 100, 0, 1)
 
+        runtime_label = "Episode length" if content_type == "TV Shows" else "Runtime"
         runtime_bucket = st.selectbox(
-            "Runtime", ["Any", "< 2 hours", "2–3 hours", "> 3 hours"], index=0
+            runtime_label, ["Any", "< 2 hours", "2–3 hours", "> 3 hours"], index=0
         )
 
         year_min, year_max = st.slider(
@@ -507,7 +542,7 @@ with st.sidebar:
         max_pages = st.slider("Search depth (TMDB pages)", 1, 5, 3)
 
         require_rt = st.checkbox("Require RT score (strict)", value=False)
-        st.caption("If strict is off, movies missing RT can appear (ranked lower).")
+        st.caption("If strict is off, titles missing RT can appear (ranked lower).")
 
         hide_seen = st.checkbox("Hide movies I've seen", value=False)
 
@@ -584,47 +619,76 @@ try:
 
     st.divider()
 
-    # 1) Discover movies from TMDB (more pages when Surprise is enabled)
+    # 1) Discover from TMDB (more pages when Surprise is enabled)
     genre_ids_key = ",".join(map(str, genre_ids))
     candidates = []
-    for page in range(1, total_pages + 1):
-        data = cached_discover(genre_ids_key, rmin, rmax, year_min, year_max, page)
-        results = data.get("results", [])
-        for m in results:
-            m["_source_page"] = page
-        candidates.extend(results)
+
+    if content_type in ("Movies", "Both"):
+        for page in range(1, total_pages + 1):
+            data = cached_discover(genre_ids_key, rmin, rmax, year_min, year_max, page)
+            results = data.get("results", [])
+            for m in results:
+                m["_source_page"] = page
+                m["_media_type"] = "movie"
+            candidates.extend(results)
+
+    if content_type in ("TV Shows", "Both"):
+        for page in range(1, total_pages + 1):
+            data = cached_discover_tv(genre_ids_key, year_min, year_max, page)
+            results = data.get("results", [])
+            for m in results:
+                m["_source_page"] = page
+                m["_media_type"] = "tv"
+            candidates.extend(results)
 
     if not candidates:
-        st.info("No movies returned from TMDB. Try loosening filters.")
+        st.info("No results returned from TMDB. Try loosening filters.")
         st.stop()
 
     # 2) Enrich candidates (OMDb only for core pages to limit API usage)
     rows = []
     wildcard_rows = []
-    progress = st.progress(0, text="Fetching movie details...")
+    progress = st.progress(0, text="Fetching details...")
     total = len(candidates)
 
     for i, m in enumerate(candidates):
         progress.progress((i + 1) / total, text=f"Processing {i+1}/{total}...")
 
-        movie_id = m.get("id")
-        title = m.get("title") or ""
+        item_id = m.get("id")
+        media_type = m.get("_media_type", "movie")
         tmdb_vote = m.get("vote_average")
         tmdb_votes = m.get("vote_count")
-        release_date = m.get("release_date") or ""
         source_page = m.get("_source_page", 1)
         is_core = source_page <= core_pages
 
-        details = cached_tmdb_details(movie_id)
-        runtime = details.get("runtime")
-        imdb_id = details.get("imdb_id")
+        if media_type == "tv":
+            title = m.get("name") or ""
+            release_date = m.get("first_air_date") or ""
+            details = cached_tmdb_tv_details(item_id)
+            # Episode runtime: array of ints, take first if available
+            ep_runtimes = details.get("episode_run_time") or []
+            runtime = ep_runtimes[0] if ep_runtimes else None
+            ext_ids = details.get("external_ids") or {}
+            imdb_id = ext_ids.get("imdb_id")
+            num_seasons = details.get("number_of_seasons")
+            omdb_type = "series"
+        else:
+            title = m.get("title") or ""
+            release_date = m.get("release_date") or ""
+            details = cached_tmdb_details(item_id)
+            runtime = details.get("runtime")
+            imdb_id = details.get("imdb_id")
+            num_seasons = None
+            omdb_type = "movie"
 
-        if runtime is None:
+        # Runtime filtering (skip TV without runtime data)
+        if media_type == "movie" and runtime is None:
             continue
-        if rmin is not None and runtime < rmin:
-            continue
-        if rmax is not None and runtime > rmax:
-            continue
+        if runtime is not None:
+            if rmin is not None and runtime < rmin:
+                continue
+            if rmax is not None and runtime > rmax:
+                continue
 
         rt = None
         imdb_rating = None
@@ -632,7 +696,7 @@ try:
 
         # Only fetch OMDb for core pages to avoid increasing API usage
         if imdb_id and is_core:
-            omdb = tracked_omdb_lookup(imdb_id)
+            omdb = tracked_omdb_lookup(imdb_id, media_type=omdb_type)
             if omdb:
                 rt = extract_rotten_tomatoes_score(omdb)
                 imdb_rating, imdb_votes = extract_imdb_score(omdb)
@@ -648,9 +712,12 @@ try:
         genre_names_list = [genre_id_to_name[gid] for gid in m.get("genre_ids", []) if gid in genre_id_to_name]
         primary_genre = genre_names_list[0] if genre_names_list else "Unknown"
 
+        # Build display runtime text
+        runtime_display = runtime if runtime is not None else 0
+
         movie_row = {
             "Title": title,
-            "Runtime (min)": runtime,
+            "Runtime (min)": runtime_display,
             "RT (%)": rt,
             "IMDb Rating": imdb_rating,
             "IMDb Votes": imdb_votes,
@@ -661,8 +728,11 @@ try:
             "Release Year": release_date[:4] if len(release_date) >= 4 else "",
             "Genres": ", ".join(genre_names_list[:3]),
             "Primary Genre": primary_genre,
+            "Type": "TV" if media_type == "tv" else "Movie",
+            "Seasons": num_seasons,
             "_is_core": is_core,
             "_imdb_id": imdb_id,
+            "_omdb_type": omdb_type,
         }
 
         # Apply RT filtering for core pages
@@ -846,7 +916,7 @@ try:
                 continue
             row = matches.iloc[0]
             if pd.isna(row.get("RT (%)")) and row.get("_imdb_id"):
-                omdb = tracked_omdb_lookup(row["_imdb_id"])
+                omdb = tracked_omdb_lookup(row["_imdb_id"], media_type=row.get("_omdb_type", "movie"))
                 if omdb:
                     rt_val = extract_rotten_tomatoes_score(omdb)
                     imdb_r, imdb_v = extract_imdb_score(omdb)
@@ -910,7 +980,7 @@ try:
             st.subheader("🎲 Your Surprise Picks")
             pages_used = total_pages
             st.caption(
-                f"Sampling from ~{surprise_pool_size} movies ({pages_used} pages) · "
+                f"Sampling from ~{surprise_pool_size} titles ({pages_used} pages) · "
                 f"Diverse by genre, era, popularity, and more"
             )
 
@@ -957,7 +1027,7 @@ try:
 
         with right:
             st.subheader(f"All matching results ({len(df_core)})")
-            display_df = df_core.drop(columns=["Release Year", "_is_core", "_imdb_id", "Genres", "Primary Genre"], errors="ignore")
+            display_df = df_core.drop(columns=["Release Year", "_is_core", "_imdb_id", "_omdb_type", "Genres", "Primary Genre", "Seasons"], errors="ignore")
             st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 except Exception:

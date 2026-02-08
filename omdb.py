@@ -48,7 +48,7 @@ def get_cache_size() -> int:
 _load_cache()
 
 
-def omdb_lookup_by_imdb_id(api_key: str, imdb_id: str, use_cache: bool = True) -> Optional[dict]:
+def omdb_lookup_by_imdb_id(api_key: str, imdb_id: str, use_cache: bool = True, media_type: str = "movie") -> Optional[dict]:
     global _cache, _cache_dirty
 
     if not imdb_id:
@@ -64,7 +64,7 @@ def omdb_lookup_by_imdb_id(api_key: str, imdb_id: str, use_cache: bool = True) -
         try:
             r = requests.get(
                 "https://www.omdbapi.com/",
-                params={"apikey": api_key, "i": imdb_id, "type": "movie", "r": "json"},
+                params={"apikey": api_key, "i": imdb_id, "type": media_type, "r": "json"},
                 timeout=30,
             )
         except requests.RequestException:
