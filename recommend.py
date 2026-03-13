@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+import math
+from datetime import datetime
 from typing import Optional, Tuple
 
 # Ranking weights (with RT available)
@@ -122,3 +126,70 @@ def rank_score(
         base = W_AUDIENCE_NO_RT * audience + W_EVIDENCE_NO_RT * evidence
 
     return _clamp(base)
+
+
+# ------------------------------------------------------------------
+# Repetition penalty constants
+# ------------------------------------------------------------------
+RECENCY_WINDOW_DAYS = 14
+FREQUENCY_WEIGHT = 0.3
+
+# Discovery score constants
+OBSCURITY_WEIGHT = 0.5
+FRESHNESS_WEIGHT = 0.4
+FRESHNESS_WINDOW_DAYS = 30
+DISCOVERY_QUALITY_FLOOR = 0.55
+DISCOVERY_POPULARITY_CAP = 2000
+DISCOVERY_MIN_VOTES = 30
+POPULARITY_LOG_SCALE = 10000
+
+
+def repetition_penalty(shown_count: int, last_shown_at: Optional[str]) -> float:
+    """
+    Returns multiplier in [0, 1]. 1.0 = no penalty.
+    recency  = min(1.0, days_elapsed / RECENCY_WINDOW_DAYS)
+    frequency = 1.0 / (1.0 + log(1 + shown_count) * FREQUENCY_WEIGHT)
+    """
+    if shown_count == 0 or last_shown_at is None:
+        return 1.0
+    try:
+        days = (datetime.now() - datetime.fromisoformat(last_shown_at)).days
+    except (ValueError, TypeError):
+        days = RECENCY_WINDOW_DAYS
+    recency = min(1.0, days / RECENCY_WINDOW_DAYS)
+    frequency = 1.0 / (1.0 + math.log(1 + shown_count) * FREQUENCY_WEIGHT)
+    return recency * frequency
+
+
+def discovery_score(
+    base_rank_score: float,
+    tmdb_votes: Optional[int],
+    shown_count: int = 0,
+    last_shown_at: Optional[str] = None,
+) -> float:
+    """
+    Secondary score for Hidden Gems lane.
+    Returns 0.0 if below quality floor or outside popularity band.
+    Upper bound ~2.0 (used only for relative ranking within gem pool).
+    """
+    votes = tmdb_votes or 0
+    if base_rank_score < DISCOVERY_QUALITY_FLOOR:
+        return 0.0
+    if votes > DISCOVERY_POPULARITY_CAP or votes < DISCOVERY_MIN_VOTES:
+        return 0.0
+
+    # Log-scaled obscurity: penalizes popularity on a log curve
+    pop_norm = math.log(votes + 1) / math.log(POPULARITY_LOG_SCALE + 1)
+    obscurity = 1.0 + OBSCURITY_WEIGHT * (1.0 - pop_norm)
+
+    # Freshness bonus: higher if not recently shown
+    if shown_count == 0 or last_shown_at is None:
+        freshness = 1.0 + FRESHNESS_WEIGHT
+    else:
+        try:
+            days = (datetime.now() - datetime.fromisoformat(last_shown_at)).days
+        except (ValueError, TypeError):
+            days = FRESHNESS_WINDOW_DAYS
+        freshness = 1.0 + FRESHNESS_WEIGHT * min(1.0, days / FRESHNESS_WINDOW_DAYS)
+
+    return base_rank_score * obscurity * freshness

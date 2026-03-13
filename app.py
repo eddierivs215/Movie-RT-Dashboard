@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import logging
 from datetime import date
@@ -13,12 +14,27 @@ from dotenv import load_dotenv
 
 from tmdb import tmdb_get_genres, tmdb_discover_movies, tmdb_movie_details, tmdb_get_tv_genres, tmdb_discover_tv, tmdb_tv_details
 from omdb import omdb_lookup_by_imdb_id, extract_rotten_tomatoes_score, extract_imdb_score, get_cache_size, flush_cache
-from recommend import runtime_bucket_to_bounds, rank_score, W_RT, W_AUDIENCE, W_EVIDENCE, W_AUDIENCE_NO_RT, W_EVIDENCE_NO_RT
+from recommend import runtime_bucket_to_bounds, rank_score, repetition_penalty, discovery_score, W_RT, W_AUDIENCE, W_EVIDENCE, W_AUDIENCE_NO_RT, W_EVIDENCE_NO_RT
+from exposure import load_exposure, save_exposure, record_shown, record_selected, get_exposure, load_seen_keys
 
 # ------------------------------------------------------------------
 # Constants
 # ------------------------------------------------------------------
 SEEN_FILE = Path(__file__).with_name("seen_movies.csv")
+
+
+def make_item_key(tmdb_id, media_type: str) -> str:
+    """Canonical key: '{tmdb_id}:{media_type}' or '' if no ID."""
+    if tmdb_id is None:
+        return ""
+    return f"{tmdb_id}:{media_type}"
+
+
+def make_filter_hash(content_type, genre_ids, min_rt, runtime_bucket, year_min, year_max, require_rt) -> str:
+    """Short hash of filter configuration for cache invalidation."""
+    args = str([content_type, sorted(genre_ids), min_rt, runtime_bucket, year_min, year_max, require_rt])
+    return hashlib.md5(args.encode()).hexdigest()[:8]
+
 
 # Page depth constants
 SURPRISE_EXTRA_PAGES = 5  # Additional pages fetched when Surprise is enabled
@@ -256,6 +272,14 @@ def diverse_surprise_sample(pool: pd.DataFrame, n: int = 5) -> pd.DataFrame:
 # ------------------------------------------------------------------
 if "seen_movies" not in st.session_state:
     st.session_state.seen_movies = load_seen()
+if "exposure_log" not in st.session_state:
+    st.session_state.exposure_log = load_exposure()
+if "seen_keys" not in st.session_state:
+    st.session_state.seen_keys = load_seen_keys(st.session_state.exposure_log)
+if "shown_recorded_this_run" not in st.session_state:
+    st.session_state.shown_recorded_this_run = False
+if "surprise_filter_hash" not in st.session_state:
+    st.session_state.surprise_filter_hash = ""
 if "surprise_reshuffle" not in st.session_state:
     st.session_state.surprise_reshuffle = False
 if "omdb_lookups_this_run" not in st.session_state:
@@ -401,7 +425,8 @@ def render_rank_explanation(row: pd.Series) -> None:
     tmdb_votes = row.get("TMDB Votes", 0)
     imdb_rating = row.get("IMDb Rating")
     imdb_votes = row.get("IMDb Votes")
-    rank_score_val = row.get("Rank Score", 0)
+    base_score = row.get("_base_score", row.get("Rank Score", 0))
+    rep_penalty = row.get("_rep_penalty", 1.0)
 
     with st.expander("🔍 Why this rank?"):
         rt_str = f"{int(rt)}%" if pd.notna(rt) else "N/A"
@@ -431,7 +456,9 @@ def render_rank_explanation(row: pd.Series) -> None:
                 "Without RT, ranking relies more heavily on TMDB/IMDb audience scores."
             )
 
-        st.markdown(f"**Final Score:** {rank_score_val:.4f}")
+        st.markdown(f"**Quality Score:** {base_score:.4f}")
+        if rep_penalty < 0.95:
+            st.caption(f"⚠️ Repetition penalty applied: ×{rep_penalty:.2f} (shown recently)")
 
 
 def render_movie_card(
@@ -441,6 +468,7 @@ def render_movie_card(
     is_wildcard: bool = False,
     genre: str = "",
     diversity_reason: str = "",
+    item_key: str = "",
 ) -> None:
     title = row["Title"]
     rt = row["RT (%)"]
@@ -491,11 +519,17 @@ def render_movie_card(
         render_rank_explanation(row)
 
     seen_key = f"seen::{prefix_key}::{title}"
+    # Derive item_key from row if not passed explicitly
+    _item_key = item_key or str(row.get("_item_key", "") or "")
     is_seen = st.checkbox("Seen", value=(title in st.session_state.seen_movies), key=seen_key)
 
     if is_seen and title not in st.session_state.seen_movies:
         st.session_state.seen_movies.add(title)
         save_seen(st.session_state.seen_movies)
+        if _item_key:
+            st.session_state.seen_keys.add(_item_key)
+            record_selected(st.session_state.exposure_log, _item_key)
+            save_exposure(st.session_state.exposure_log)
     elif not is_seen and title in st.session_state.seen_movies:
         st.session_state.seen_movies.discard(title)
         save_seen(st.session_state.seen_movies)
@@ -547,6 +581,8 @@ with st.sidebar:
         hide_seen = st.checkbox("Hide movies I've seen", value=False)
 
         applied = st.form_submit_button("🔍 Apply filters")
+        if applied:
+            st.session_state.shown_recorded_this_run = False
 
     st.divider()
     st.header("⚡ Mode")
@@ -591,6 +627,16 @@ with st.sidebar:
 genre_ids = [genres_map[g] for g in selected_genres if g in genres_map]
 genre_id_to_name = {v: k for k, v in genres_map.items()}
 rmin, rmax = runtime_bucket_to_bounds(runtime_bucket)
+
+# Filter hash invalidation for surprise picks
+current_filter_hash = make_filter_hash(
+    content_type, genre_ids, min_rt, runtime_bucket, year_min, year_max, require_rt
+)
+if current_filter_hash != st.session_state.surprise_filter_hash:
+    st.session_state.pop("surprise_picks", None)
+    st.session_state.pop("surprise_wildcards", None)
+    st.session_state.surprise_reshuffle = True
+    st.session_state.surprise_filter_hash = current_filter_hash
 
 # ------------------------------------------------------------------
 # Determine page depth (adaptive based on Surprise mode)
@@ -715,6 +761,11 @@ try:
         # Build display runtime text
         runtime_display = runtime if runtime is not None else 0
 
+        # Stable canonical key + repetition penalty
+        _item_key = make_item_key(item_id, media_type)
+        exp = get_exposure(st.session_state.exposure_log, _item_key)
+        penalty = repetition_penalty(exp["shown_count"], exp["last_shown_at"])
+
         movie_row = {
             "Title": title,
             "Runtime (min)": runtime_display,
@@ -724,6 +775,9 @@ try:
             "TMDB Vote": tmdb_vote,
             "TMDB Votes": tmdb_votes,
             "Rank Score": round(score, 4),
+            "_base_score": round(score, 4),
+            "_rep_penalty": round(penalty, 4),
+            "_adj_score": round(score * penalty, 4),
             "Overview": (m.get("overview") or "")[:MAX_OVERVIEW_LENGTH],
             "Release Year": release_date[:4] if len(release_date) >= 4 else "",
             "Genres": ", ".join(genre_names_list[:3]),
@@ -733,6 +787,8 @@ try:
             "_is_core": is_core,
             "_imdb_id": imdb_id,
             "_omdb_type": omdb_type,
+            "_tmdb_id": item_id,
+            "_item_key": _item_key,
         }
 
         # Apply RT filtering for core pages
@@ -783,14 +839,21 @@ try:
             ["Rank Score", "TMDB Vote"], ascending=False
         ).reset_index(drop=True)
 
-    # Apply "hide seen" filter
+    # Apply "hide seen" filter using canonical keys (OR title fallback)
     if hide_seen:
-        df_all = df_all[~df_all["Title"].isin(st.session_state.seen_movies)].reset_index(drop=True)
-        df_core = df_core[~df_core["Title"].isin(st.session_state.seen_movies)].reset_index(drop=True)
+        seen_keys_set = st.session_state.seen_keys
+        seen_movies_set = st.session_state.seen_movies
+
+        def _seen_mask(df: pd.DataFrame) -> pd.Series:
+            by_title = df["Title"].isin(seen_movies_set)
+            has_key = df["_item_key"].fillna("") != ""
+            by_key = has_key & df["_item_key"].isin(seen_keys_set)
+            return by_title | by_key
+
+        df_all = df_all[~_seen_mask(df_all)].reset_index(drop=True)
+        df_core = df_core[~_seen_mask(df_core)].reset_index(drop=True)
         if not wildcard_df.empty:
-            wildcard_df = wildcard_df[
-                ~wildcard_df["Title"].isin(st.session_state.seen_movies)
-            ].reset_index(drop=True)
+            wildcard_df = wildcard_df[~_seen_mask(wildcard_df)].reset_index(drop=True)
 
     # Coverage stats (from core only, since that's where OMDb was fetched)
     rt_present = int(df_core["RT (%)"].notna().sum()) if "RT (%)" in df_core.columns else 0
@@ -799,6 +862,21 @@ try:
     )
 
     render_omdb_status(len(df_core), rt_present, imdb_present)
+
+    # Discovery scores (computed here; updated again after second-pass enrichment)
+    def _compute_discovery_scores(df: pd.DataFrame) -> pd.Series:
+        exp_log = st.session_state.exposure_log
+        return df.apply(
+            lambda row: discovery_score(
+                base_rank_score=row.get("_base_score", 0),
+                tmdb_votes=row.get("TMDB Votes"),
+                shown_count=get_exposure(exp_log, str(row.get("_item_key", "") or ""))["shown_count"],
+                last_shown_at=get_exposure(exp_log, str(row.get("_item_key", "") or ""))["last_shown_at"],
+            ),
+            axis=1,
+        )
+
+    df_all["_discovery_score"] = _compute_discovery_scores(df_all)
 
     # ------------------------------------------------------------------
     # Surprise selection with expanded pool
@@ -832,6 +910,8 @@ try:
         )
 
         if need_resample and not pool.empty:
+            # Sort pool by adjusted score (penalizes recently-shown titles)
+            pool = pool.sort_values("_adj_score", ascending=False).reset_index(drop=True)
             if surprise_bias == "Pure random":
                 sample_pool = pool
             else:
@@ -866,7 +946,17 @@ try:
             wildcard_titles: list[str] = []
             main_genres = set()
             for t in strict_picks:
-                match = pool[pool["Title"] == t]
+                # Prefer key-based lookup; fall back to title
+                match = pd.DataFrame()
+                key_col = pool["_item_key"].fillna("")
+                if key_col.any():
+                    title_matches = pool[pool["Title"] == t]
+                    if not title_matches.empty:
+                        item_key_lookup = str(title_matches.iloc[0].get("_item_key", "") or "")
+                        if item_key_lookup:
+                            match = pool[pool["_item_key"] == item_key_lookup]
+                if match.empty:
+                    match = pool[pool["Title"] == t]
                 if not match.empty:
                     main_genres.add(match.iloc[0].get("Primary Genre", ""))
 
@@ -920,7 +1010,12 @@ try:
                 if omdb:
                     rt_val = extract_rotten_tomatoes_score(omdb)
                     imdb_r, imdb_v = extract_imdb_score(omdb)
-                    idx_mask = df_all["Title"] == title
+                    # Prefer key-based update; fall back to title
+                    item_key_val = str(row.get("_item_key", "") or "")
+                    if item_key_val:
+                        idx_mask = df_all["_item_key"] == item_key_val
+                    else:
+                        idx_mask = df_all["Title"] == title
                     if idx_mask.any():
                         df_all.loc[idx_mask, "RT (%)"] = rt_val
                         df_all.loc[idx_mask, "IMDb Rating"] = imdb_r
@@ -928,7 +1023,10 @@ try:
                         new_score = rank_score(rt=rt_val, tmdb_vote=row["TMDB Vote"],
                                                tmdb_votes=row["TMDB Votes"],
                                                imdb_rating=imdb_r, imdb_votes=imdb_v)
+                        cur_penalty = float(df_all.loc[idx_mask, "_rep_penalty"].iloc[0]) if idx_mask.any() else 1.0
                         df_all.loc[idx_mask, "Rank Score"] = round(new_score, 4)
+                        df_all.loc[idx_mask, "_base_score"] = round(new_score, 4)
+                        df_all.loc[idx_mask, "_adj_score"] = round(new_score * cur_penalty, 4)
         flush_cache()
 
         # Refresh surprise_df after enrichment
@@ -938,6 +1036,9 @@ try:
             enriched_wc = df_all[df_all["Title"].isin(display_wildcards)]
             if not enriched_wc.empty:
                 wildcard_picks_df = enriched_wc.reset_index(drop=True)
+
+        # Recompute discovery scores now that enriched RT data is available
+        df_all["_discovery_score"] = _compute_discovery_scores(df_all)
 
         # Generate diversity reasons
         used_d: set[str] = set()
@@ -958,10 +1059,28 @@ try:
                 surprise_diversity_reasons[r["Title"]] = reason
 
     # ------------------------------------------------------------------
+    # Hidden Gems pool (computed once, used in decide & browse modes)
+    # ------------------------------------------------------------------
+    # Ensure _discovery_score exists even if surprise section was skipped
+    if "_discovery_score" not in df_all.columns:
+        df_all["_discovery_score"] = _compute_discovery_scores(df_all)
+
+    best_bets_keys = set(df_core.head(5)["_item_key"].fillna("").tolist())
+    best_bets_keys.discard("")  # don't let empty string accidentally filter things
+
+    df_gems = df_all[
+        (df_all["_discovery_score"] > 0)
+        & (~df_all["_item_key"].isin(best_bets_keys))
+    ].sort_values("_discovery_score", ascending=False).reset_index(drop=True)
+
+    # ------------------------------------------------------------------
     # Layout based on mode
     # ------------------------------------------------------------------
     is_decide_mode = view_mode == "Decide Now (90s)"
     is_surprise_mode = view_mode == "Surprise Me"
+
+    # Collect items rendered in main lanes for exposure tracking
+    items_for_exposure: list[tuple] = []  # (item_key, media_type, title, release_year)
 
     if is_surprise_mode:
         # Dedicated Surprise Me view
@@ -989,6 +1108,12 @@ try:
                 for row_chunk in rows_of_3:
                     cols = st.columns(3)
                     for col_idx, (_, r) in enumerate(row_chunk.iterrows()):
+                        items_for_exposure.append((
+                            str(r.get("_item_key", "") or ""),
+                            str(r.get("Type", "")),
+                            str(r.get("Title", "")),
+                            str(r.get("Release Year", "")),
+                        ))
                         with cols[col_idx]:
                             render_movie_card(
                                 r,
@@ -1001,6 +1126,12 @@ try:
                 st.markdown("### 🃏 Wildcards")
                 wc_cols = st.columns(3)
                 for wc_idx, (_, r) in enumerate(wildcard_picks_df.iterrows()):
+                    items_for_exposure.append((
+                        str(r.get("_item_key", "") or ""),
+                        str(r.get("Type", "")),
+                        str(r.get("Title", "")),
+                        str(r.get("Release Year", "")),
+                    ))
                     with wc_cols[wc_idx % 3]:
                         render_movie_card(
                             r,
@@ -1015,7 +1146,20 @@ try:
 
         st.markdown("### ✅ Top 5 Ranked")
         for idx, r in df_core.head(5).iterrows():
+            items_for_exposure.append((
+                str(r.get("_item_key", "") or ""),
+                str(r.get("Type", "")),
+                str(r.get("Title", "")),
+                str(r.get("Release Year", "")),
+            ))
             render_movie_card(r, prefix_key=f"top5_{idx}", show_rank_explanation=True)
+
+        if not df_gems.empty:
+            with st.expander("💎 Hidden Gems — quality picks you may have missed", expanded=False):
+                st.caption("Smaller films with strong scores not recently shown.")
+                gems_display = df_gems.head(3)
+                for gem_idx, (_, r) in enumerate(gems_display.iterrows()):
+                    render_movie_card(r, prefix_key=f"gem_{gem_idx}")
 
     else:
         left, right = st.columns([1, 2], gap="large")
@@ -1023,12 +1167,41 @@ try:
         with left:
             st.subheader("✅ Top 5 recommendations (ranked)")
             for idx, r in df_core.head(5).iterrows():
+                items_for_exposure.append((
+                    str(r.get("_item_key", "") or ""),
+                    str(r.get("Type", "")),
+                    str(r.get("Title", "")),
+                    str(r.get("Release Year", "")),
+                ))
                 render_movie_card(r, prefix_key=f"top5_{idx}", show_rank_explanation=True)
+
+            if not df_gems.empty:
+                with st.expander("💎 Hidden Gems — quality picks you may have missed", expanded=False):
+                    st.caption("Smaller films with strong scores not recently shown.")
+                    gems_display = df_gems.head(3)
+                    for gem_idx, (_, r) in enumerate(gems_display.iterrows()):
+                        render_movie_card(r, prefix_key=f"gem_browse_{gem_idx}")
 
         with right:
             st.subheader(f"All matching results ({len(df_core)})")
-            display_df = df_core.drop(columns=["Release Year", "_is_core", "_imdb_id", "_omdb_type", "Genres", "Primary Genre", "Seasons"], errors="ignore")
+            _internal_cols = [
+                "Release Year", "_is_core", "_imdb_id", "_omdb_type", "Genres",
+                "Primary Genre", "Seasons", "_tmdb_id", "_item_key",
+                "_base_score", "_rep_penalty", "_adj_score", "_discovery_score",
+            ]
+            display_df = df_core.drop(columns=_internal_cols, errors="ignore")
             st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    # ------------------------------------------------------------------
+    # Record exposure for visible lanes (once per logical page view)
+    # ------------------------------------------------------------------
+    if not st.session_state.shown_recorded_this_run and items_for_exposure:
+        exp_log = st.session_state.exposure_log
+        for ik, mtype, ttl, yr in items_for_exposure:
+            if ik:
+                record_shown(exp_log, ik, mtype, ttl, yr)
+        save_exposure(exp_log)
+        st.session_state.shown_recorded_this_run = True
 
 except Exception:
     logger.exception("App crashed with unhandled exception")
